@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PriAxom AIR Eye</title>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@700&display=swap');
+
+        body, html {
+            margin: 0; padding: 0; width: 100vw; height: 100vh;
+            background-color: #000; overflow: hidden;
+            font-family: 'Courier New', Courier, monospace;
+        }
+        #output_canvas {
+            display: block; width: 100vw; height: 100vh;
+            transform: scaleX(-1);
+        }
+        #hud {
+            position: absolute; top: 20px; left: 20px;
+            pointer-events: none; z-index: 10;
+        }
+        h1 { 
+            margin: 0; font-family: 'Outfit', sans-serif; font-size: 36px; letter-spacing: 1px;
+            background: linear-gradient(90deg, #4285F4, #EA4335, #FBBC05, #34A853);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            text-shadow: 0 0 20px rgba(255,255,255,0.1);
+        }
+        p { margin: 5px 0 0 0; font-size: 14px; color: #00ffff; text-shadow: 0 0 10px #00ffff; opacity: 0.9; }
+        .video-feed { display: none; }
+    </style>
+</head>
+<body>
+
+    <div id="hud">
+        <h1>PriAxom AIR Eye</h1>
+        <p>System Active // Parallel Processing Engaged</p>
+        <p id="status_text">State: IDLE</p>
+        <p id="mic_status">Mic: INITIALIZING...</p>
+    </div>
+
+    <video class="video-feed" id="input_video" autoplay playsinline></video>
+    <canvas id="output_canvas"></canvas>
+
+    <script>
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const statusText = document.getElementById('status_text');
+        const micStatus = document.getElementById('mic_status');
+
+        // Matrix Indices
+        const LEFT_EYE = [33, 160, 158, 133, 153, 144];
+        const RIGHT_EYE = [362, 385, 387, 263, 373, 380];
+        const IRIS_L = 468;
+        const IRIS_R = 473;
+        const MOUTH_INNER = { top: 13, bottom: 14, left: 78, right: 308 };
+        
+        // Hand Skeleton Mapping Arrays
+        const HAND_LINES = [
+            [0, 1, 2, 3, 4],        // Thumb
+            [0, 5, 6, 7, 8],        // Index
+            [9, 10, 11, 12],        // Middle
+            [13, 14, 15, 16],       // Ring
+            [0, 17, 18, 19, 20],    // Pinky
+            [5, 9, 13, 17]          // Palm cross-section
+        ];
+
+        // System State
+        let isDrawing = false;
+        let paths = [];
+        let currentPath = [];
+        let currentGaze = { x: 0, y: 0 };
+        
+        // Pipeline State Buffers
+        let currentFaceLandmarks = null;
+        let currentHandLandmarks = null;
+        
+        // Kinematic Constants
+        let isMouthOpen = false;
+        const MAR_THRESHOLD = 0.15; // Highly sensitive toggle threshold
+        
+        let isPinching = false;
+        let lastPinchPos = { x: 0, y: 0 };
+        const PINCH_THRESHOLD = 0.05;
+
+        function resizeCanvas() {
+            canvasElement.width = window.innerWidth;
+            canvasElement.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        // Voice Subsystem
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (SpeechRecognition) {
+            const recognition = new SpeechRecognition();
+            recognition.continuous = true;
+            recognition.interimResults = true;
+            
+            recognition.onstart = () => { micStatus.innerText = "Mic: LISTENING (Say 'Clear')"; };
+            recognition.onresult = (event) => {
+                for (let i = event.resultIndex; i < event.results.length; ++i) {
+                    if (event.results[i][0].transcript.toLowerCase().includes("clear")) {
+                        paths = [];
+                        currentPath = [];
+                    }
+                }
+            };
+            recognition.onerror = (e) => { micStatus.innerText = "Mic: ERROR - " + e.error; };
+            recognition.onend = () => { recognition.start(); };
+            recognition.start();
+        } else {
+            micStatus.innerText = "Mic: UNAVAILABLE";
+        }
+
+        // Geometric Math
+        function getMAR(landmarks) {
+            const dist = (pA, pB) => Math.hypot(pA.x - pB.x, pA.y - pB.y);
+            return dist(landmarks[MOUTH_INNER.top], landmarks[MOUTH_INNER.bottom]) / 
+                   dist(landmarks[MOUTH_INNER.left], landmarks[MOUTH_INNER.right]);
+        }
+
+        // Processing Pipeline: Face
+        function onFaceResults(results) {
+            if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+                currentFaceLandmarks = results.multiFaceLandmarks[0];
+
+                const irisL = currentFaceLandmarks[IRIS_L];
+                const irisR = currentFaceLandmarks[IRIS_R];
+                currentGaze = {
+                    x: ((irisL.x + irisR.x) / 2) * canvasElement.width,
+                    y: ((irisL.y + irisR.y) / 2) * canvasElement.height
+                };
+
+                const currentMAR = getMAR(currentFaceLandmarks);
+                
+                if (currentMAR > MAR_THRESHOLD) {
+                    isMouthOpen = true;
+                } else if (currentMAR < MAR_THRESHOLD * 0.7 && isMouthOpen) {
+                    isMouthOpen = false;
+                    isDrawing = !isDrawing;
+                    
+                    if (isDrawing) {
+                        currentPath = [{ x: currentGaze.x, y: currentGaze.y }];
+                        paths.push(currentPath);
+                        statusText.innerText = "State: DRAWING (Continuous)";
+                    } else {
+                        statusText.innerText = "State: IDLE";
+                    }
+                }
+
+                if (isDrawing && currentPath) {
+                    currentPath.push({ x: currentGaze.x, y: currentGaze.y });
+                }
+            } else {
+                currentFaceLandmarks = null;
+            }
+        }
+
+        // Processing Pipeline: Hand
+        function onHandResults(results) {
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                currentHandLandmarks = results.multiHandLandmarks[0];
+                const thumbTip = currentHandLandmarks[4];
+                const indexTip = currentHandLandmarks[8];
+                
+                const distance = Math.hypot(thumbTip.x - indexTip.x, thumbTip.y - indexTip.y);
+                const pinchScreenX = ((thumbTip.x + indexTip.x) / 2) * canvasElement.width;
+                const pinchScreenY = ((thumbTip.y + indexTip.y) / 2) * canvasElement.height;
+
+                if (distance < PINCH_THRESHOLD) {
+                    if (!isPinching) {
+                        isPinching = true;
+                        lastPinchPos = { x: pinchScreenX, y: pinchScreenY };
+                        statusText.innerText = "State: PANNING (Pinch Detected)";
+                    } else {
+                        const dx = pinchScreenX - lastPinchPos.x;
+                        const dy = pinchScreenY - lastPinchPos.y;
+
+                        paths.forEach(path => {
+                            path.forEach(point => {
+                                point.x += dx;
+                                point.y += dy;
+                            });
+                        });
+                        lastPinchPos = { x: pinchScreenX, y: pinchScreenY };
+                    }
+                } else {
+                    if (isPinching) {
+                        isPinching = false;
+                        statusText.innerText = isDrawing ? "State: DRAWING" : "State: IDLE";
+                    }
+                }
+            } else {
+                currentHandLandmarks = null;
+            }
+        }
+
+        // Render Subsystem (GPU Decoupled)
+        function drawSkeleton(landmarks, indices, color) {
+            canvasCtx.beginPath();
+            canvasCtx.strokeStyle = color;
+            canvasCtx.lineWidth = 1;
+            canvasCtx.shadowBlur = 5;
+            canvasCtx.shadowColor = color;
+            for (let i = 0; i < indices.length; i++) {
+                const pt = landmarks[indices[i]];
+                const x = pt.x * canvasElement.width;
+                const y = pt.y * canvasElement.height;
+                if (i === 0) canvasCtx.moveTo(x, y);
+                else canvasCtx.lineTo(x, y);
+            }
+            canvasCtx.stroke();
+            canvasCtx.shadowBlur = 0;
+        }
+
+        function renderLoop() {
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+            // 1. Render Face Wireframe
+            if (currentFaceLandmarks) {
+                drawSkeleton(currentFaceLandmarks, LEFT_EYE, 'rgba(0, 255, 255, 0.5)');
+                drawSkeleton(currentFaceLandmarks, RIGHT_EYE, 'rgba(0, 255, 255, 0.5)');
+            }
+
+            // 2. Render Hand Wireframe
+            if (currentHandLandmarks) {
+                HAND_LINES.forEach(line => drawSkeleton(currentHandLandmarks, line, 'rgba(255, 0, 255, 0.5)'));
+            }
+
+            // 3. Render Vector Paths
+            canvasCtx.strokeStyle = "#4285F4";
+            canvasCtx.lineWidth = 3;
+            canvasCtx.shadowBlur = 10;
+            canvasCtx.shadowColor = "#4285F4";
+
+            paths.forEach(path => {
+                if (path.length < 2) return;
+                canvasCtx.beginPath();
+                canvasCtx.moveTo(path[0].x, path[0].y);
+                for (let i = 1; i < path.length; i++) {
+                    canvasCtx.lineTo(path[i].x, path[i].y);
+                }
+                canvasCtx.stroke();
+            });
+            canvasCtx.shadowBlur = 0;
+
+            // 4. Render Dynamic Cursor
+            canvasCtx.fillStyle = isDrawing ? "#34A853" : "#EA4335";
+            canvasCtx.beginPath();
+            canvasCtx.arc(currentGaze.x, currentGaze.y, 5, 0, 2 * Math.PI);
+            canvasCtx.fill();
+
+            requestAnimationFrame(renderLoop);
+        }
+
+        // Initialization
+        const faceMesh = new FaceMesh({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`});
+        faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+        faceMesh.onResults(onFaceResults);
+
+        const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+        hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+        hands.onResults(onHandResults);
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                // Execute tensor processing in parallel
+                await Promise.all([
+                    faceMesh.send({image: videoElement}),
+                    hands.send({image: videoElement})
+                ]);
+            },
+            width: 1280, height: 720
+        });
+        
+        camera.start();
+        requestAnimationFrame(renderLoop);
+    </script>
+</body>
+</html>
