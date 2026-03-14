@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PriAxom AIR Eye</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100vw;
+            height: 100vh;
+            background-color: #000;
+            overflow: hidden;
+            font-family: 'Courier New', Courier, monospace;
+        }
+        #output_canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+            transform: scaleX(-1); /* Mirror the camera */
+        }
+        #hud {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: #00ffff;
+            text-shadow: 0 0 10px #00ffff;
+            pointer-events: none;
+            z-index: 10;
+        }
+        h1 { margin: 0; font-size: 24px; letter-spacing: 2px; }
+        p { margin: 5px 0 0 0; font-size: 14px; opacity: 0.8; }
+        .video-feed { display: none; }
+    </style>
+</head>
+<body>
+
+    <div id="hud">
+        <h1>PriAxom AIR Eye</h1>
+        <p>System Active // Awaiting input</p>
+        <p id="status_text">State: IDLE</p>
+    </div>
+
+    <video class="video-feed" id="input_video" autoplay playsinline></video>
+    <canvas id="output_canvas"></canvas>
+
+    <script>
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const statusText = document.getElementById('status_text');
+
+        // Eye Landmark Indices (MediaPipe)
+        const LEFT_EYE = [33, 160, 158, 133, 153, 144];
+        const RIGHT_EYE = [362, 385, 387, 263, 373, 380];
+        const IRIS_L = 468;
+        const IRIS_R = 473;
+
+        // Interaction State Variables
+        let drawingState = 'IDLE'; // IDLE, DRAWING
+        let anchorPoints = [];
+        let currentGaze = { x: 0, y: 0 };
+        
+        // Blink Detection Timers
+        let blinkStartTime = 0;
+        let isBlinking = false;
+        let lastBlinkTime = 0;
+        const EAR_THRESHOLD = 0.02; // Adjust based on lighting/distance
+
+        function resizeCanvas() {
+            canvasElement.width = window.innerWidth;
+            canvasElement.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        // Calculate Eye Aspect Ratio (EAR)
+        function getEAR(landmarks, eyeIndices) {
+            const p1 = landmarks[eyeIndices[0]];
+            const p2 = landmarks[eyeIndices[1]];
+            const p3 = landmarks[eyeIndices[2]];
+            const p4 = landmarks[eyeIndices[3]];
+            const p5 = landmarks[eyeIndices[4]];
+            const p6 = landmarks[eyeIndices[5]];
+
+            const dist = (pA, pB) => Math.hypot(pA.x - pB.x, pA.y - pB.y);
+            const v1 = dist(p2, p6);
+            const v2 = dist(p3, p5);
+            const h = dist(p1, p4);
+            return (v1 + v2) / (2.0 * h);
+        }
+
+        function drawSkeleton(landmarks, indices, color) {
+            canvasCtx.beginPath();
+            canvasCtx.strokeStyle = color;
+            canvasCtx.lineWidth = 1.5;
+            canvasCtx.shadowBlur = 10;
+            canvasCtx.shadowColor = color;
+            for (let i = 0; i < indices.length; i++) {
+                const pt = landmarks[indices[i]];
+                const x = pt.x * canvasElement.width;
+                const y = pt.y * canvasElement.height;
+                if (i === 0) canvasCtx.moveTo(x, y);
+                else canvasCtx.lineTo(x, y);
+            }
+            canvasCtx.closePath();
+            canvasCtx.stroke();
+            canvasCtx.shadowBlur = 0; // reset
+        }
+
+        function handleBlinkLogic(ear, currentGazePos) {
+            const now = Date.now();
+            
+            if (ear < EAR_THRESHOLD) {
+                if (!isBlinking) {
+                    isBlinking = true;
+                    blinkStartTime = now;
+                }
+            } else {
+                if (isBlinking) {
+                    isBlinking = false;
+                    const blinkDuration = now - blinkStartTime;
+                    const timeSinceLastBlink = now - lastBlinkTime;
+
+                    // Double Blink detection (< 400ms between blinks)
+                    if (timeSinceLastBlink < 400 && drawingState === 'DRAWING') {
+                        drawingState = 'IDLE';
+                        anchorPoints = [];
+                        statusText.innerText = "State: END DRAWING (Double Blink)";
+                    } 
+                    // 0.5s Long Blink detection
+                    else if (blinkDuration >= 500 && blinkDuration < 1500) {
+                        if (drawingState === 'IDLE') {
+                            drawingState = 'DRAWING';
+                            anchorPoints.push(currentGazePos);
+                        } else if (drawingState === 'DRAWING') {
+                            anchorPoints.push(currentGazePos);
+                        }
+                        statusText.innerText = `State: DRAWING (${anchorPoints.length} points)`;
+                    }
+                    
+                    lastBlinkTime = now;
+                }
+            }
+        }
+
+        function drawLines() {
+            if (anchorPoints.length > 0) {
+                canvasCtx.beginPath();
+                canvasCtx.strokeStyle = "#ff00ff";
+                canvasCtx.lineWidth = 3;
+                canvasCtx.shadowBlur = 15;
+                canvasCtx.shadowColor = "#ff00ff";
+
+                // Draw anchored segments
+                canvasCtx.moveTo(anchorPoints[0].x, anchorPoints[0].y);
+                for (let i = 1; i < anchorPoints.length; i++) {
+                    canvasCtx.lineTo(anchorPoints[i].x, anchorPoints[i].y);
+                }
+
+                // Draw active following line
+                if (drawingState === 'DRAWING') {
+                    canvasCtx.lineTo(currentGaze.x, currentGaze.y);
+                }
+                
+                canvasCtx.stroke();
+                
+                // Draw dots at anchors
+                canvasCtx.fillStyle = "#fff";
+                anchorPoints.forEach(pt => {
+                    canvasCtx.beginPath();
+                    canvasCtx.arc(pt.x, pt.y, 4, 0, 2 * Math.PI);
+                    canvasCtx.fill();
+                });
+            }
+        }
+
+        function onResults(results) {
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+            if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+                const landmarks = results.multiFaceLandmarks[0];
+
+                // Render Robotic Skeleton
+                drawSkeleton(landmarks, LEFT_EYE, '#00ffff');
+                drawSkeleton(landmarks, RIGHT_EYE, '#00ffff');
+
+                // Calculate approximate gaze position using Iris
+                const irisL = landmarks[IRIS_L];
+                // Map to screen (amplified for visibility)
+                currentGaze = {
+                    x: irisL.x * canvasElement.width,
+                    y: irisL.y * canvasElement.height
+                };
+
+                // Detect Blinks
+                const leftEAR = getEAR(landmarks, LEFT_EYE);
+                const rightEAR = getEAR(landmarks, RIGHT_EYE);
+                const avgEAR = (leftEAR + rightEAR) / 2;
+
+                handleBlinkLogic(avgEAR, { ...currentGaze });
+            }
+
+            drawLines();
+        }
+
+        const faceMesh = new FaceMesh({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`;
+        }});
+        faceMesh.setOptions({
+            maxNumFaces: 1,
+            refineLandmarks: true, // Crucial for iris tracking
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+        faceMesh.onResults(onResults);
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await faceMesh.send({image: videoElement});
+            },
+            width: 1280,
+            height: 720
+        });
+        camera.start();
+    </script>
+</body>
+</html>
