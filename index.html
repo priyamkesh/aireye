@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PriAxom AIR Eye</title>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;700&display=swap');
+
+        body, html {
+            margin: 0; padding: 0; width: 100vw; height: 100vh;
+            background-color: #000; overflow: hidden;
+            font-family: 'Courier New', Courier, monospace;
+        }
+        #output_canvas { display: block; width: 100vw; height: 100vh; transform: scaleX(-1); }
+        #hud { position: absolute; top: 20px; left: 20px; pointer-events: none; z-index: 10; }
+        h1 { 
+            margin: 0; font-family: 'Outfit', sans-serif; font-size: 36px; letter-spacing: 1px;
+            background: linear-gradient(90deg, #4285F4, #EA4335, #FBBC05, #34A853);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        }
+        #hud p { 
+            margin: 5px 0 0 0; font-family: 'Outfit', sans-serif; font-size: 14px; 
+            color: #00ffff; opacity: 0.9; letter-spacing: 0.5px;
+        }
+        .video-feed { display: none; }
+    </style>
+</head>
+<body>
+
+    <div id="hud">
+        <h1>PriAxom AIR Eye</h1>
+        <p>System Active // Engine: Compound Kinematics + Bezier Splines</p>
+        <p id="status_text">State: IDLE | Color: BLUE</p>
+    </div>
+
+    <video class="video-feed" id="input_video" autoplay playsinline></video>
+    <canvas id="output_canvas"></canvas>
+
+    <script>
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d', { desynchronized: true, alpha: false });
+        const statusText = document.getElementById('status_text');
+
+        // Geometries
+        const LEFT_EYE_CONTOUR = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246];
+        const RIGHT_EYE_CONTOUR = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398];
+        const IRIS_L = 468;
+        const IRIS_R = 473;
+        const MOUTH_INNER = { top: 13, bottom: 14, left: 78, right: 308 };
+        const HAND_CONNECTIONS = [ [0,1,2,3,4], [0,5,6,7,8], [9,10,11,12], [13,14,15,16], [0,17,18,19,20], [5,9,13,17] ];
+
+        let cw = 0, ch = 0;
+
+        // Kinematic System Variables
+        let isDrawing = false;
+        let paths = []; 
+        let currentPath = null;
+        let currentPenColor = "#00a2ff"; 
+        let colorName = "BLUE";
+        
+        // 60 FPS Target Interpolation
+        const targetGaze = { x: 0, y: 0 };
+        const currentGaze = { x: 0, y: 0 };
+        const LERP_FACTOR = 0.25; 
+        const PUPIL_AMPLIFIER = 15.0; // Defines how far the pupil can roam from the head anchor
+        
+        let currentFaceLandmarks = null;
+        let currentHandLandmarks = null;
+        
+        let isMouthOpen = false;
+        const MAR_THRESHOLD = 0.15; 
+        
+        let isPinching = false;
+        const lastPinchPos = { x: 0, y: 0 };
+        const PINCH_THRESHOLD_SQ = 0.0025; 
+
+        function resizeCanvas() {
+            cw = window.innerWidth; ch = window.innerHeight;
+            canvasElement.width = cw; canvasElement.height = ch;
+            targetGaze.x = cw / 2; targetGaze.y = ch / 2;
+            currentGaze.x = cw / 2; currentGaze.y = ch / 2;
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        function setColor(hex, name) {
+            if (currentPenColor === hex) return;
+            currentPenColor = hex; colorName = name;
+            statusText.innerText = `State: ${isDrawing ? 'DRAWING' : 'IDLE'} | Color: ${colorName}`;
+            if (isDrawing) {
+                currentPath = { color: currentPenColor, points: [] };
+                paths.push(currentPath);
+            }
+        }
+
+        // Voice Command Subsystem
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (SpeechRecognition) {
+            const recognition = new SpeechRecognition();
+            recognition.continuous = true; recognition.interimResults = true;
+            recognition.onresult = (event) => {
+                const transcript = event.results[event.results.length - 1][0].transcript.toLowerCase();
+                if (transcript.includes("clear")) { paths.length = 0; currentPath = null; }
+                else if (transcript.includes("red")) setColor("#ff0000", "RED");
+                else if (transcript.includes("blue")) setColor("#00a2ff", "BLUE");
+                else if (transcript.includes("green")) setColor("#00ff00", "GREEN");
+                else if (transcript.includes("yellow")) setColor("#ffff00", "YELLOW");
+                else if (transcript.includes("pink")) setColor("#ff00ff", "PINK");
+                else if (transcript.includes("white")) setColor("#ffffff", "WHITE");
+            };
+            recognition.onend = () => { recognition.start(); };
+            recognition.start();
+        }
+
+        const getDistSq = (pA, pB) => { const dx = pA.x - pB.x; const dy = pA.y - pB.y; return (dx * dx) + (dy * dy); };
+        const getDist = (pA, pB) => Math.sqrt(getDistSq(pA, pB));
+
+        // Compound Tracking Algorithm (Macro Head + Micro Pupil)
+        function calculateCompoundGaze(landmarks) {
+            // 1. Calculate Base Head Anchor (Midpoint between both eyes)
+            const headAnchorX = (landmarks[33].x + landmarks[263].x) / 2;
+            const headAnchorY = (landmarks[33].y + landmarks[263].y) / 2;
+
+            // 2. Calculate Pupil Vectors (Distance from center of eye sockets to the Iris)
+            const lEyeCenterX = (landmarks[33].x + landmarks[133].x) / 2;
+            const lEyeCenterY = (landmarks[159].y + landmarks[145].y) / 2;
+            const pupilDeltaLX = landmarks[IRIS_L].x - lEyeCenterX;
+            const pupilDeltaLY = landmarks[IRIS_L].y - lEyeCenterY;
+
+            const rEyeCenterX = (landmarks[362].x + landmarks[263].x) / 2;
+            const rEyeCenterY = (landmarks[386].y + landmarks[374].y) / 2;
+            const pupilDeltaRX = landmarks[IRIS_R].x - rEyeCenterX;
+            const pupilDeltaRY = landmarks[IRIS_R].y - rEyeCenterY;
+
+            // Average Pupil Delta for stability
+            const avgPupilDeltaX = (pupilDeltaLX + pupilDeltaRX) / 2;
+            const avgPupilDeltaY = (pupilDeltaLY + pupilDeltaRY) / 2;
+
+            // 3. Combine Head Anchor + Amplified Pupil Roam
+            const finalRatioX = headAnchorX + (avgPupilDeltaX * PUPIL_AMPLIFIER);
+            const finalRatioY = headAnchorY + (avgPupilDeltaY * PUPIL_AMPLIFIER);
+
+            // Project to screen
+            targetGaze.x = finalRatioX * cw;
+            targetGaze.y = finalRatioY * ch;
+        }
+
+        function onFaceResults(results) {
+            currentFaceLandmarks = results.multiFaceLandmarks?.[0] || null;
+
+            if (currentFaceLandmarks) {
+                calculateCompoundGaze(currentFaceLandmarks);
+
+                const currentMAR = getDist(currentFaceLandmarks[MOUTH_INNER.top], currentFaceLandmarks[MOUTH_INNER.bottom]) / 
+                                   getDist(currentFaceLandmarks[MOUTH_INNER.left], currentFaceLandmarks[MOUTH_INNER.right]);
+                
+                if (currentMAR > MAR_THRESHOLD) {
+                    isMouthOpen = true;
+                } else if (currentMAR < MAR_THRESHOLD * 0.7 && isMouthOpen) {
+                    isMouthOpen = false;
+                    isDrawing = !isDrawing;
+                    
+                    if (isDrawing) {
+                        currentPath = { color: currentPenColor, points: [{ x: currentGaze.x, y: currentGaze.y }] };
+                        paths.push(currentPath);
+                        statusText.innerText = `State: DRAWING | Color: ${colorName}`;
+                    } else {
+                        currentPath = null;
+                        statusText.innerText = `State: IDLE | Color: ${colorName}`;
+                    }
+                }
+            }
+        }
+
+        function onHandResults(results) {
+            currentHandLandmarks = results.multiHandLandmarks?.[0] || null;
+
+            if (currentHandLandmarks) {
+                const thumbTip = currentHandLandmarks[4];
+                const indexTip = currentHandLandmarks[8];
+                const distSq = getDistSq(thumbTip, indexTip); 
+                
+                const pinchScreenX = ((thumbTip.x + indexTip.x) / 2) * cw;
+                const pinchScreenY = ((thumbTip.y + indexTip.y) / 2) * ch;
+
+                if (distSq < PINCH_THRESHOLD_SQ) {
+                    if (!isPinching) {
+                        isPinching = true;
+                        lastPinchPos.x = pinchScreenX; lastPinchPos.y = pinchScreenY;
+                        statusText.innerText = `State: PANNING | Color: ${colorName}`;
+                    } else {
+                        const dx = pinchScreenX - lastPinchPos.x;
+                        const dy = pinchScreenY - lastPinchPos.y;
+
+                        for (let i = 0; i < paths.length; i++) {
+                            const pts = paths[i].points;
+                            for (let j = 0; j < pts.length; j++) { pts[j].x += dx; pts[j].y += dy; }
+                        }
+                        lastPinchPos.x = pinchScreenX; lastPinchPos.y = pinchScreenY;
+                    }
+                } else if (isPinching) {
+                    isPinching = false;
+                    statusText.innerText = `State: ${isDrawing ? 'DRAWING' : 'IDLE'} | Color: ${colorName}`;
+                }
+            }
+        }
+
+        function drawPerfectEye(landmarks, indices, color) {
+            canvasCtx.beginPath(); canvasCtx.strokeStyle = color; canvasCtx.lineWidth = 1;
+            canvasCtx.moveTo(landmarks[indices[0]].x * cw, landmarks[indices[0]].y * ch);
+            for (let i = 1; i < indices.length; i++) canvasCtx.lineTo(landmarks[indices[i]].x * cw, landmarks[indices[i]].y * ch);
+            canvasCtx.closePath(); canvasCtx.stroke();
+        }
+
+        function drawRoboticHand(landmarks) {
+            canvasCtx.strokeStyle = '#00ffff'; canvasCtx.lineWidth = 1.5;
+            for(let i=0; i<HAND_CONNECTIONS.length; i++){
+                const indices = HAND_CONNECTIONS[i];
+                canvasCtx.beginPath();
+                canvasCtx.moveTo(landmarks[indices[0]].x * cw, landmarks[indices[0]].y * ch);
+                for (let j = 1; j < indices.length; j++) canvasCtx.lineTo(landmarks[indices[j]].x * cw, landmarks[indices[j]].y * ch);
+                canvasCtx.stroke();
+            }
+            canvasCtx.fillStyle = '#ffffff'; canvasCtx.beginPath();
+            for(let i=0; i<21; i++) {
+                const x = landmarks[i].x * cw; const y = landmarks[i].y * ch;
+                canvasCtx.moveTo(x + 2, y); canvasCtx.arc(x, y, 2, 0, 2 * Math.PI);
+            }
+            canvasCtx.fill();
+        }
+
+        // Fluid Quadratic Bezier Smoothing Algorithm
+        function traceBezierPath(pts) {
+            canvasCtx.beginPath();
+            canvasCtx.moveTo(pts[0].x, pts[0].y);
+            
+            // Loop array to generate mathematically smooth geometric curves between all points
+            for (let i = 1; i < pts.length - 1; i++) {
+                const xc = (pts[i].x + pts[i + 1].x) / 2;
+                const yc = (pts[i].y + pts[i + 1].y) / 2;
+                canvasCtx.quadraticCurveTo(pts[i].x, pts[i].y, xc, yc);
+            }
+            
+            // Lock the final point
+            if (pts.length > 1) {
+                canvasCtx.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
+            }
+            canvasCtx.stroke();
+        }
+
+        function renderGlowingPaths() {
+            for (let i = 0; i < paths.length; i++) {
+                const pts = paths[i].points; const col = paths[i].color;
+                if (pts.length < 2) continue;
+
+                // Ambient Plasma Core
+                canvasCtx.strokeStyle = col;
+                canvasCtx.globalAlpha = 0.3; canvasCtx.lineWidth = 12;
+                traceBezierPath(pts);
+
+                // Laser Core
+                canvasCtx.globalAlpha = 1.0; canvasCtx.lineWidth = 3;
+                traceBezierPath(pts);
+            }
+            canvasCtx.globalAlpha = 1.0; 
+        }
+
+        // 60Hz Render Loop
+        function renderLoop() {
+            // Apply Lerp Physics
+            currentGaze.x += (targetGaze.x - currentGaze.x) * LERP_FACTOR;
+            currentGaze.y += (targetGaze.y - currentGaze.y) * LERP_FACTOR;
+
+            if (isDrawing && currentPath) {
+                const lastPt = currentPath.points[currentPath.points.length - 1];
+                if (!lastPt || getDistSq(lastPt, currentGaze) > 2) {
+                    currentPath.points.push({ x: currentGaze.x, y: currentGaze.y });
+                }
+            }
+
+            canvasCtx.fillStyle = '#000000'; canvasCtx.fillRect(0, 0, cw, ch);
+
+            if (currentFaceLandmarks) {
+                drawPerfectEye(currentFaceLandmarks, LEFT_EYE_CONTOUR, 'rgba(0, 255, 255, 0.4)');
+                drawPerfectEye(currentFaceLandmarks, RIGHT_EYE_CONTOUR, 'rgba(0, 255, 255, 0.4)');
+            }
+
+            if (currentHandLandmarks) drawRoboticHand(currentHandLandmarks);
+
+            renderGlowingPaths();
+
+            canvasCtx.fillStyle = currentPenColor; canvasCtx.beginPath();
+            canvasCtx.arc(currentGaze.x, currentGaze.y, 4, 0, 2 * Math.PI); canvasCtx.fill();
+
+            requestAnimationFrame(renderLoop);
+        }
+
+        // Model Operations
+        const faceMesh = new FaceMesh({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`});
+        faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+        faceMesh.onResults(onFaceResults);
+
+        const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+        hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+        hands.onResults(onHandResults);
+
+        let processFaceNext = true;
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                if (processFaceNext) await faceMesh.send({image: videoElement});
+                else await hands.send({image: videoElement});
+                processFaceNext = !processFaceNext; 
+            },
+            width: 320, height: 240 
+        });
+        
+        camera.start();
+        requestAnimationFrame(renderLoop);
+    </script>
+</body>
+</html>
