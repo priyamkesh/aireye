@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>PriAxom AIR Eye</title>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;700&display=swap');
+        
+        body, html { 
+            margin: 0; padding: 0; width: 100vw; height: 100vh; 
+            background-color: #000; overflow: hidden; font-family: 'Outfit', sans-serif; 
+        }
+        
+        /* Native Video Background */
+        .video-feed {
+            position: absolute; top: 0; left: 0; width: 100vw; height: 100vh;
+            object-fit: cover; z-index: 1; opacity: 0; pointer-events: none;
+            transform: scaleX(-1); -webkit-transform: scaleX(-1);
+            transition: opacity 0.3s ease;
+        }
+        .video-feed.visible { opacity: 1; }
+
+        /* Transparent Overlay */
+        #output_canvas { 
+            position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; 
+            z-index: 2; background-color: #000; transition: background-color 0.3s ease;
+            transform: scaleX(-1); -webkit-transform: translateZ(0) scaleX(-1);
+        }
+        #output_canvas.transparent { background-color: transparent; }
+
+        /* Legacy-Safe UI Overlay */
+        #title-box {
+            position: absolute; top: 15px; left: 15px; z-index: 20;
+        }
+        .minimal-title {
+            margin: 0; font-weight: 700; font-size: 24px; white-space: nowrap;
+            background: linear-gradient(90deg, #a855f7, #6b21a8);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        }
+        .byline {
+            margin: 2px 0 0 0; font-size: 12px; color: #ffffff; opacity: 0.9;
+        }
+        
+        #btn-cam {
+            position: absolute; top: 18px; right: 75px; z-index: 20;
+            background: transparent; border: none; padding: 0; cursor: pointer; outline: none;
+        }
+        #btn-cam span {
+            font-family: 'Outfit', sans-serif; font-weight: 700; font-size: 18px; letter-spacing: 1px;
+            background: linear-gradient(90deg, #00ffff, #ffff00);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        }
+        
+        #btn-switch {
+            position: absolute; top: 15px; right: 15px; z-index: 20;
+            background: transparent; border: 1px solid rgba(255, 255, 255, 0.3); 
+            border-radius: 4px; outline: none; padding: 3px 8px;
+            color: #ffffff; font-family: 'Outfit', sans-serif; font-weight: 700;
+            font-size: 16px; cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+
+    <video class="video-feed" id="input_video" autoplay playsinline muted></video>
+    <canvas id="output_canvas"></canvas>
+
+    <div id="title-box">
+        <h1 class="minimal-title">PriAxom AIR Eye©</h1>
+        <p class="byline">By Priyam Kesh</p>
+    </div>
+    
+    <button id="btn-cam"><span>CAM</span></button>
+    <button id="btn-switch">&lt;&gt;</button>
+
+    <script>
+        // STRICT ES5 JAVASCRIPT: No let, no const, no async/await, no arrow functions.
+        var videoElement = document.getElementById('input_video');
+        var canvasElement = document.getElementById('output_canvas');
+        var canvasCtx = canvasElement.getContext('2d', { desynchronized: true, alpha: true });
+
+        var btnCam = document.getElementById('btn-cam');
+        var btnSwitch = document.getElementById('btn-switch');
+
+        var EYE_PTS = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246, 362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398];
+        var HAND_CONNECTIONS = [[0,1,2,3,4], [0,5,6,7,8], [9,10,11,12], [13,14,15,16], [0,17,18,19,20], [5,9,13,17]];
+
+        var targetFacePts = new Float32Array(64); var renderFacePts = new Float32Array(64);
+        var targetHandPts = new Float32Array(42); var renderHandPts = new Float32Array(42);
+        
+        var hasFace = false, faceLostFrames = 0;
+        var hasHand = false, handLostFrames = 0;
+
+        var cw = 0, ch = 0;
+        var showVideo = false;
+        var currentCameraFacing = "user"; 
+        var cameraObj = null;
+
+        var isProcessing = false, isDrawing = false;
+        var paths = [], currentPath = null, currentPenColor = "#00a2ff"; 
+        
+        var targetGazeX = 0, targetGazeY = 0; var gazeX = 0, gazeY = 0; 
+        var targetEraserX = 0, targetEraserY = 0; var eraserX = 0, eraserY = 0;
+        
+        var isMouthOpen = false; 
+        var MAR_THRESHOLD_SQ = 0.007; 
+        
+        var isEraserTarget = false, isEraserActual = false;
+        var ERASER_RADIUS_SQ = 8000; 
+        var MAX_PATH_LENGTH = 400; 
+        
+        function dSq(p1, p2) {
+            var dx = p1.x - p2.x;
+            var dy = p1.y - p2.y;
+            return (dx * dx) + (dy * dy);
+        }
+
+        function resizeCanvas() {
+            cw = window.innerWidth; 
+            ch = window.innerHeight;
+            canvasElement.width = cw; canvasElement.height = ch;
+        }
+        window.addEventListener('resize', resizeCanvas); 
+        resizeCanvas();
+
+        // UI Listeners
+        btnCam.addEventListener('click', function() {
+            showVideo = !showVideo;
+            if (showVideo) {
+                videoElement.classList.add('visible');
+                canvasElement.classList.add('transparent');
+            } else {
+                videoElement.classList.remove('visible');
+                canvasElement.classList.remove('transparent');
+            }
+        });
+
+        btnSwitch.addEventListener('click', function() {
+            if (cameraObj) {
+                cameraObj.stop();
+            }
+            
+            currentCameraFacing = currentCameraFacing === "user" ? "environment" : "user";
+            
+            var scaleStr = currentCameraFacing === "user" ? "scaleX(-1)" : "scaleX(1)";
+            videoElement.style.transform = scaleStr;
+            videoElement.style.webkitTransform = scaleStr;
+            canvasElement.style.transform = scaleStr;
+            canvasElement.style.webkitTransform = "translateZ(0) " + scaleStr;
+
+            startEngineCamera();
+        });
+
+        // Background Voice Subsystem
+        var SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (SpeechRecognition) {
+            var recognition = new SpeechRecognition();
+            recognition.continuous = true; recognition.interimResults = true;
+            recognition.onresult = function(event) {
+                var transcript = event.results[event.results.length - 1][0].transcript.toLowerCase();
+                if (transcript.indexOf("clear") !== -1) { paths.length = 0; currentPath = null; }
+                else if (transcript.indexOf("red") !== -1) currentPenColor = "#ff0000";
+                else if (transcript.indexOf("blue") !== -1) currentPenColor = "#00a2ff";
+                else if (transcript.indexOf("green") !== -1) currentPenColor = "#00ff00";
+                else if (transcript.indexOf("pink") !== -1) currentPenColor = "#ff00ff";
+                else if (transcript.indexOf("white") !== -1) currentPenColor = "#ffffff";
+                
+                if (isDrawing && currentPath) {
+                    currentPath = { color: currentPenColor, pts: [gazeX, gazeY] };
+                    paths.push(currentPath);
+                }
+            };
+            recognition.onend = function() { recognition.start(); };
+            recognition.start();
+        }
+
+        // --- AI WORKERS ---
+        function onFaceResults(results) {
+            var lm = results.multiFaceLandmarks ? results.multiFaceLandmarks[0] : null;
+            if (!lm) { 
+                faceLostFrames++; 
+                if (faceLostFrames > 5) hasFace = false; 
+                return; 
+            }
+            hasFace = true; faceLostFrames = 0;
+
+            for (var i = 0; i < 32; i++) {
+                targetFacePts[i*2] = lm[EYE_PTS[i]].x * cw;
+                targetFacePts[i*2 + 1] = lm[EYE_PTS[i]].y * ch;
+            }
+
+            targetGazeX = ((lm[33].x + lm[133].x + lm[362].x + lm[263].x) / 4) * cw;
+            targetGazeY = ((lm[33].y + lm[133].y + lm[362].y + lm[263].y) / 4) * ch;
+
+            var currentMARSq = dSq(lm[13], lm[14]) / dSq(lm[78], lm[308]);
+            
+            if (currentMARSq > MAR_THRESHOLD_SQ) {
+                isMouthOpen = true;
+            } else if (currentMARSq < MAR_THRESHOLD_SQ * 0.5 && isMouthOpen) {
+                isMouthOpen = false;
+                if (!isEraserTarget) {
+                    isDrawing = !isDrawing;
+                    if (isDrawing) {
+                        currentPath = { color: currentPenColor, pts: [gazeX, gazeY] }; 
+                        paths.push(currentPath);
+                    } else currentPath = null;
+                }
+            }
+        }
+
+        function onHandResults(results) {
+            var lm = results.multiHandLandmarks ? results.multiHandLandmarks[0] : null;
+            if (!lm) { 
+                handLostFrames++; 
+                if (handLostFrames > 2) { hasHand = false; isEraserTarget = false; }
+                return; 
+            }
+            hasHand = true; handLostFrames = 0;
+
+            for (var i = 0; i < 21; i++) {
+                targetHandPts[i*2] = lm[i].x * cw;
+                targetHandPts[i*2 + 1] = lm[i].y * ch;
+            }
+
+            targetEraserX = lm[8].x * cw; 
+            targetEraserY = lm[8].y * ch;
+
+            var tClosed = dSq(lm[4], lm[17]) < dSq(lm[3], lm[17]); 
+            var iOpen   = dSq(lm[8], lm[0]) > dSq(lm[6], lm[0]);   
+            var mClosed = dSq(lm[12], lm[0]) < dSq(lm[10], lm[0]); 
+            var rClosed = dSq(lm[16], lm[0]) < dSq(lm[14], lm[0]); 
+            var pClosed = dSq(lm[20], lm[0]) < dSq(lm[18], lm[0]); 
+
+            isEraserTarget = tClosed && iOpen && mClosed && rClosed && pClosed;
+            if (isEraserTarget) isDrawing = false; 
+        }
+
+        // --- 60FPS RENDER ENGINE ---
+        function drawSkeletons() {
+            if (hasFace) {
+                canvasCtx.strokeStyle = '#00ffff'; canvasCtx.lineWidth = 1.5;
+                canvasCtx.beginPath();
+                canvasCtx.moveTo(renderFacePts[0]|0, renderFacePts[1]|0);
+                for(var i=2; i<32; i+=2) canvasCtx.lineTo(renderFacePts[i]|0, renderFacePts[i+1]|0);
+                canvasCtx.closePath(); canvasCtx.stroke();
+                
+                canvasCtx.beginPath();
+                canvasCtx.moveTo(renderFacePts[32]|0, renderFacePts[33]|0);
+                for(var j=34; j<64; j+=2) canvasCtx.lineTo(renderFacePts[j]|0, renderFacePts[j+1]|0);
+                canvasCtx.closePath(); canvasCtx.stroke();
+            }
+
+            if (hasHand) {
+                canvasCtx.strokeStyle = isEraserActual ? '#ff0000' : '#00ffff'; 
+                canvasCtx.lineWidth = isEraserActual ? 4 : 2;
+                canvasCtx.beginPath();
+                for (var k = 0; k < 6; k++) {
+                    var ind = HAND_CONNECTIONS[k];
+                    canvasCtx.moveTo(renderHandPts[ind[0]*2]|0, renderHandPts[ind[0]*2+1]|0);
+                    for (var l = 1; l < ind.length; l++) {
+                        canvasCtx.lineTo(renderHandPts[ind[l]*2]|0, renderHandPts[ind[l]*2+1]|0);
+                    }
+                }
+                canvasCtx.stroke();
+
+                if (isEraserActual) {
+                    canvasCtx.fillStyle = 'rgba(255, 0, 0, 0.3)';
+                    canvasCtx.beginPath();
+                    canvasCtx.arc(eraserX|0, eraserY|0, Math.sqrt(ERASER_RADIUS_SQ), 0, Math.PI*2);
+                    canvasCtx.fill();
+                }
+            }
+        }
+
+        function renderLoop() {
+            if (showVideo) canvasCtx.clearRect(0, 0, cw, ch); 
+            else { canvasCtx.fillStyle = '#000000'; canvasCtx.fillRect(0, 0, cw, ch); }
+
+            gazeX += (targetGazeX - gazeX) * 0.4; gazeY += (targetGazeY - gazeY) * 0.4;
+            eraserX += (targetEraserX - eraserX) * 0.4; eraserY += (targetEraserY - eraserY) * 0.4;
+
+            if (hasFace) for (var i=0; i<64; i++) renderFacePts[i] += (targetFacePts[i] - renderFacePts[i]) * 0.4;
+            if (hasHand) for (var j=0; j<42; j++) renderHandPts[j] += (targetHandPts[j] - renderHandPts[j]) * 0.4;
+
+            drawSkeletons();
+
+            if (isEraserTarget && !isEraserActual) {
+                isEraserActual = true; currentPath = null; 
+            } else if (!isEraserTarget && isEraserActual) {
+                isEraserActual = false; 
+            }
+
+            if (isEraserActual && paths.length > 0) {
+                for (var p = paths.length - 1; p >= 0; p--) {
+                    var pts = paths[p].pts;
+                    for (var q = 0; q < pts.length; q += 2) {
+                        var dxE = pts[q] - eraserX;
+                        var dyE = pts[q+1] - eraserY;
+                        if ((dxE * dxE) + (dyE * dyE) < ERASER_RADIUS_SQ) {
+                            paths.splice(p, 1);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (isDrawing && currentPath) {
+                currentPath.pts.push(gazeX, gazeY);
+                if (currentPath.pts.length > MAX_PATH_LENGTH * 2) currentPath.pts.splice(0, 2);
+            }
+
+            if (paths.length > 0) {
+                canvasCtx.lineWidth = 4;
+                for (var r = 0; r < paths.length; r++) {
+                    var currPts = paths[r].pts; var len = currPts.length;
+                    if (len < 4) continue;
+                    canvasCtx.beginPath();
+                    canvasCtx.moveTo(currPts[0]|0, currPts[1]|0);
+                    for (var s = 2; s < len; s += 2) canvasCtx.lineTo(currPts[s]|0, currPts[s+1]|0);
+                    canvasCtx.strokeStyle = paths[r].color;
+                    canvasCtx.stroke();
+                }
+            }
+
+            if (!isEraserActual && hasFace) {
+                canvasCtx.fillStyle = isDrawing ? currentPenColor : '#ffffff'; 
+                canvasCtx.beginPath();
+                canvasCtx.arc(gazeX|0, gazeY|0, isDrawing ? 6 : 4, 0, 2 * Math.PI); 
+                canvasCtx.fill();
+            }
+
+            requestAnimationFrame(renderLoop);
+        }
+
+        // --- INFERENCE INIT ---
+        var faceMesh = new FaceMesh({locateFile: function(file) { return "https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/" + file; }});
+        faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: false, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+        faceMesh.onResults(onFaceResults);
+
+        var hands = new Hands({locateFile: function(file) { return "https://cdn.jsdelivr.net/npm/@mediapipe/hands/" + file; }});
+        hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.75, minTrackingConfidence: 0.5 });
+        hands.onResults(onHandResults);
+
+        var processFaceNext = true;
+        
+        function startEngineCamera() {
+            cameraObj = new Camera(videoElement, {
+                onFrame: function() {
+                    if (isProcessing) return; 
+                    isProcessing = true;
+                    
+                    var promise;
+                    if (processFaceNext) {
+                        promise = faceMesh.send({image: videoElement});
+                    } else {
+                        promise = hands.send({image: videoElement});
+                    }
+                    
+                    if (promise && promise.then) {
+                        promise.then(function() {
+                            processFaceNext = !processFaceNext; 
+                            isProcessing = false;
+                        }).catch(function(e) {
+                            console.error(e);
+                            isProcessing = false;
+                        });
+                    } else {
+                        processFaceNext = !processFaceNext; 
+                        isProcessing = false;
+                    }
+                },
+                width: 128, height: 96,
+                facingMode: currentCameraFacing
+            });
+            cameraObj.start();
+        }
+
+        startEngineCamera();
+        requestAnimationFrame(renderLoop); 
+    </script>
+</body>
+  </html>
+  
